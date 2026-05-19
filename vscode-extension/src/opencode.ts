@@ -79,17 +79,19 @@ export class OpenCodeDataAccess {
 			if (this._dbCache && this._dbCache.path === dbPath && this._dbCache.mtime === mtime) {
 				return this._dbCache.db;
 			}
-			// Cache miss or stale — close old instance and re-open
-			if (this._dbCache) {
-				try { this._dbCache.db.close(); } catch { /* ignore */ }
-				this._dbCache = null;
-			}
+			// Cache miss or stale — attempt to re-open before clearing old cache.
+			// Only clear the old cache after successfully creating the new DB.
 			const SQL = await this.initSqlJs();
 			const buffer = fs.readFileSync(dbPath);
 			const db = new SQL.Database(buffer);
+			// Success: now clear the old cache and store the new one.
+			if (this._dbCache) {
+				try { this._dbCache.db.close(); } catch { /* ignore */ }
+			}
 			this._dbCache = { db, mtime, path: dbPath };
 			return db;
 		} catch {
+			// On error, keep the old cache so queries can fall back to stale data.
 			return null;
 		}
 	}
