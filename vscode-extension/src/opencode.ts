@@ -12,6 +12,7 @@ import type { ModelUsage } from './types';
 export class OpenCodeDataAccess {
 	private _sqlJsModule: any = null;
 	private _dbCache: { db: any; mtime: number; path: string } | null = null;
+	private _dbCacheInflight: Map<number, Promise<any | null>> = new Map();
 	private readonly extensionUri: vscode.Uri;
 
 	constructor(extensionUri: vscode.Uri) {
@@ -70,28 +71,57 @@ export class OpenCodeDataAccess {
 	 * Returns a cached SQL.Database instance for opencode.db, re-opening only when
 	 * the file's mtime changes. This avoids reading and parsing the entire DB file
 	 * on every query (which was the primary cause of ~700ms-per-call latency).
+	 * 
+	 * Uses single-flight deduplication to prevent concurrent calls from each re-reading
+	 * the DB file and leaving instances unclosed.
 	 */
 	private async getOpenCodeDb(): Promise<any | null> {
 		const dbPath = path.join(this.getOpenCodeDataDir(), 'opencode.db');
-		if (!fs.existsSync(dbPath)) { return null; }
+		if (!fs.existsSync(dbPath)) {
+			// DB file does not exist; clean up stale cache if any.
+			if (this._dbCache) {
+				try { this._dbCache.db.close(); } catch { /* ignore */ }
+				this._dbCache = null;
+			}
+			return null;
+		}
 		try {
 			const mtime = fs.statSync(dbPath).mtimeMs;
+			
+			// Return cached DB if it's still valid (same path and mtime).
 			if (this._dbCache && this._dbCache.path === dbPath && this._dbCache.mtime === mtime) {
 				return this._dbCache.db;
 			}
-			// Cache miss or stale — attempt to re-open before clearing old cache.
-			// Only clear the old cache after successfully creating the new DB.
-			const SQL = await this.initSqlJs();
-			const buffer = fs.readFileSync(dbPath);
-			const db = new SQL.Database(buffer);
-			// Success: now clear the old cache and store the new one.
-			if (this._dbCache) {
-				try { this._dbCache.db.close(); } catch { /* ignore */ }
-			}
-			this._dbCache = { db, mtime, path: dbPath };
-			return db;
+			
+			// Check if another caller is already refreshing this mtime — if so, await their result.
+			const inflight = this._dbCacheInflight.get(mtime);
+			if (inflight) { return inflight; }
+			
+			// Cache miss or stale — create a new DB. Use single-flight so concurrent
+			// callers all wait for the same DB creation rather than each re-reading.
+			const createDbPromise = (async () => {
+				try {
+					const SQL = await this.initSqlJs();
+					const buffer = fs.readFileSync(dbPath);
+					const db = new SQL.Database(buffer);
+					
+					// Success: close the old cache (now that new DB is ready) and store the new one.
+					if (this._dbCache) {
+						try { this._dbCache.db.close(); } catch { /* ignore */ }
+					}
+					this._dbCache = { db, mtime, path: dbPath };
+					return db;
+				} catch {
+					// On error, keep the old cache so queries can fall back to stale data.
+					return null;
+				}
+			})();
+			
+			this._dbCacheInflight.set(mtime, createDbPromise);
+			const result = await createDbPromise;
+			this._dbCacheInflight.delete(mtime);
+			return result;
 		} catch {
-			// On error, keep the old cache so queries can fall back to stale data.
 			return null;
 		}
 	}
